@@ -1,0 +1,13 @@
+# Virtual environment
+venv/
+
+# Streamlit secrets — never commit API keys
+.streamlit/secrets.toml
+
+# Review log (local only, may contain session data)
+review_log.csv
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
