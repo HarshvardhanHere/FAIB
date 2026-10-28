@@ -15,6 +15,14 @@ POLICY_PATH = APP_DIR / "lending_policy.md"
 DATA_PATH = next(iter(APP_DIR.glob("bharat_horizon_home_loan_dataset_v2*.xlsx")), None)
 LOG_PATH = APP_DIR / "review_log.csv"
 
+# Propagate secrets to environment for RAG and services
+for _sec_key in ["GEMINI_API_KEY", "GEMINI_MODEL", "OPENROUTER_API_KEY", "OPENROUTER_MODEL", "LLM_PROVIDER"]:
+    try:
+        if _sec_key in st.secrets and not os.getenv(_sec_key):
+            os.environ[_sec_key] = str(st.secrets[_sec_key]).strip()
+    except Exception:
+        pass
+
 st.set_page_config(
     page_title="LoanLens | Bharat Horizon Bank",
     page_icon="🏦",
@@ -481,12 +489,16 @@ def compute_applicant(
         "estimated_proposed_emi_inr": float(proposed_emi),
     }
 
-    X = pd.DataFrame([{k: applicant[k] for k in [
+    X_dict = {k: applicant[k] for k in [
         "monthly_income_inr", "credit_score", "loan_amount_inr",
         "loan_tenure_years", "existing_emi_inr", "employment_years",
         "past_default", "employment_type", "foir",
         "loan_to_annual_income_ratio"
-    ]}])
+    ]}
+    # The trained model expects foir as a decimal ratio (e.g. 0.356 rather than 35.6%)
+    if X_dict["foir"] > 1.0:
+        X_dict["foir"] = X_dict["foir"] / 100.0
+    X = pd.DataFrame([X_dict])
     pred = str(model.predict(X)[0])
     try:
         probs = model.predict_proba(X)[0]
@@ -943,6 +955,9 @@ Educational prototype — Not financial advice.
     # ── Top Question Card ─────────────────────────────────────────────────────
     default_question = "Why was this application rejected?"
 
+    has_gemini = bool(os.getenv("GEMINI_API_KEY") or ("GEMINI_API_KEY" in st.secrets))
+    has_openrouter = bool(os.getenv("OPENROUTER_API_KEY") or ("OPENROUTER_API_KEY" in st.secrets))
+
     with st.container(border=True):
         st.html("""<div style="font-size: 0.88rem; font-weight: 700; color: #30213A; margin-bottom: 0.35rem;">
 Your question
@@ -964,7 +979,50 @@ Your question
         with btn_col:
             query_submitted = st.button("Retrieve policy and generate explanation →", use_container_width=True)
 
+        with st.expander("⚙️ LLM Provider & Model Settings", expanded=False):
+            p_col1, p_col2 = st.columns([50, 50])
+            with p_col1:
+                env_p = (os.getenv("LLM_PROVIDER") or "").strip().lower()
+                default_p_idx = 1 if (env_p == "openrouter" or (not has_gemini and has_openrouter)) else 0
+                chosen_p = st.selectbox(
+                    "Selected Provider",
+                    ["Gemini (Google)", "OpenRouter"],
+                    index=default_p_idx,
+                    key="ui_llm_provider"
+                )
+            with p_col2:
+                if "OpenRouter" in chosen_p:
+                    default_m = os.getenv("OPENROUTER_MODEL") or "meta-llama/llama-3.3-70b-instruct:free"
+                    custom_model = st.text_input(
+                        "OpenRouter Model Identifier",
+                        value=default_m,
+                        help="Exact model identifier from openrouter.ai/models, e.g. meta-llama/llama-3.3-70b-instruct:free, google/gemini-2.0-flash-exp:free, openai/gpt-4o-mini",
+                        key="ui_openrouter_model"
+                    )
+                    os.environ["OPENROUTER_MODEL"] = custom_model.strip()
+                    status_badge = "🟢 Key detected" if has_openrouter else "⚪ No OPENROUTER_API_KEY set (Extractive fallback)"
+                    st.caption(f"Status: {status_badge}")
+                else:
+                    default_m = os.getenv("GEMINI_MODEL") or "gemini-flash-lite-latest"
+                    custom_model = st.text_input(
+                        "Gemini Model",
+                        value=default_m,
+                        help="Google Gemini model name, e.g. gemini-flash-lite-latest, gemini-3.5-flash-lite",
+                        key="ui_gemini_model"
+                    )
+                    os.environ["GEMINI_MODEL"] = custom_model.strip()
+                    status_badge = "🟢 Key detected" if has_gemini else "⚪ No GEMINI_API_KEY set (Extractive fallback)"
+                    st.caption(f"Status: {status_badge}")
+
     st.html("<div style='height: 12px;'></div>")
+
+    # Determine active provider
+    active_provider = "openrouter" if "OpenRouter" in st.session_state.get("ui_llm_provider", "") else "gemini"
+
+    # Invalidate cached result if provider changed
+    if st.session_state.get("last_rag_provider") != active_provider:
+        query_submitted = True
+        st.session_state.last_rag_provider = active_provider
 
     # Execute or load cached RAG result with space-separated context tokens
     context = {
@@ -983,7 +1041,7 @@ Your question
         context["policy flags"] = ", ".join(applicant["policy_flags"])
 
     if "last_rag_result" not in st.session_state or query_submitted:
-        result = rag.answer(user_question, context, top_k=3, use_llm=True)
+        result = rag.answer(user_question, context, top_k=3, use_llm=True, provider=active_provider)
         st.session_state.last_rag_result = result
     else:
         result = st.session_state.last_rag_result
@@ -1000,10 +1058,8 @@ Your question
 </div>""")
 
             explanation_text = result["answer"]
-            st.html(f"""<div style="font-size: 0.88rem; color: #30213A; line-height: 1.55; margin-bottom: 1.1rem;">
-{explanation_text}
-</div>
-<div class="ll-sub-header" style="margin-top: 0.8rem; margin-bottom: 0.75rem;">
+            st.markdown(explanation_text)
+            st.html("""<div class="ll-sub-header" style="margin-top: 1.1rem; margin-bottom: 0.75rem;">
 <span style="font-size: 1.05rem; color: #4B176F;">📖</span>
 <span>Relevant policy clauses</span>
 </div>""")
